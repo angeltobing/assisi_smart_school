@@ -1,0 +1,273 @@
+
+-- ============================================
+-- ASSISI SMART SCHOOL
+-- MIGRASI DATABASE AKADEMIK 2026/2027
+-- MODUL: USERS, CLASSES, SUBJECTS
+-- ============================================
+
+-- 1. PERLUAS TABEL PROFIL
+alter table public.profiles
+add column if not exists student_number text unique,
+add column if not exists employee_number text unique,
+add column if not exists phone text,
+add column if not exists is_active boolean default true;
+
+-- 2. PERLUAS TABEL KELAS
+alter table public.school_classes
+add column if not exists major text,
+add column if not exists section text,
+add column if not exists homeroom_teacher_id uuid
+references public.profiles(id),
+add column if not exists is_active boolean default true;
+
+-- 3. PERLUAS TABEL MATA PELAJARAN
+alter table public.subjects
+add column if not exists subject_code text unique,
+add column if not exists description text,
+add column if not exists is_active boolean default true;
+
+-- 4. TABEL PENUGASAN MENGAJAR
+create table if not exists public.teaching_assignments (
+ id uuid primary key default gen_random_uuid(),
+ teacher_id uuid not null references public.profiles(id),
+ subject_id uuid not null references public.subjects(id),
+ class_id uuid not null references public.school_classes(id),
+ academic_year text not null default '2026/2027',
+ created_at timestamptz default now(),
+ unique(teacher_id,subject_id,class_id,academic_year)
+);
+
+-- 5. INDEKS DATABASE
+create index if not exists idx_profiles_role
+on public.profiles(role);
+
+create index if not exists idx_profiles_class
+on public.profiles(class_id);
+
+create index if not exists idx_classes_grade
+on public.school_classes(grade);
+
+create index if not exists idx_subjects_teacher
+on public.subjects(teacher_id);
+
+create index if not exists idx_assignments_teacher
+on public.teaching_assignments(teacher_id);
+
+create index if not exists idx_assignments_class
+on public.teaching_assignments(class_id);
+
+-- 6. FUNGSI PEMERIKSAAN HAK AKSES
+create or replace function public.current_role()
+returns text
+language sql
+stable
+security definer
+set search_path = public
+as $$
+ select role
+ from public.profiles
+ where id = (select auth.uid())
+ and is_active = true
+ limit 1;
+$$;
+
+create or replace function public.is_management()
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+ select coalesce(
+  public.current_role() in ('admin','principal'),
+  false
+ );
+$$;
+
+create or replace function public.is_principal()
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+ select coalesce(
+  public.current_role() = 'principal',
+  false
+ );
+$$;
+
+create or replace function public.current_class_id()
+returns uuid
+language sql
+stable
+security definer
+set search_path = public
+as $$
+ select class_id
+ from public.profiles
+ where id = (select auth.uid())
+ and is_active = true
+ limit 1;
+$$;
+
+revoke all on function public.current_role() from public;
+revoke all on function public.is_management() from public;
+revoke all on function public.is_principal() from public;
+revoke all on function public.current_class_id() from public;
+
+grant execute on function public.current_role() to authenticated;
+grant execute on function public.is_management() to authenticated;
+grant execute on function public.is_principal() to authenticated;
+grant execute on function public.current_class_id() to authenticated;
+
+-- 7. MENCEGAH PERUBAHAN JABATAN SEMBARANGAN
+create or replace function public.protect_profile_role()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+ if new.role is distinct from old.role
+    and not public.is_principal() then
+  raise exception 'Hanya kepala sekolah yang boleh mengubah jabatan pengguna.';
+ end if;
+
+ return new;
+end;
+$$;
+
+drop trigger if exists protect_profile_role_trigger
+on public.profiles;
+
+create trigger protect_profile_role_trigger
+before update on public.profiles
+for each row
+execute function public.protect_profile_role();
+
+-- 8. AKTIFKAN RLS
+alter table public.profiles enable row level security;
+alter table public.school_classes enable row level security;
+alter table public.subjects enable row level security;
+alter table public.teaching_assignments enable row level security;
+
+-- 9. HAPUS KEBIJAKAN LAMA
+drop policy if exists "Read own profile or management"
+on public.profiles;
+
+drop policy if exists "Management manages profiles"
+on public.profiles;
+
+drop policy if exists "Authenticated read classes"
+on public.school_classes;
+
+drop policy if exists "Management manages classes"
+on public.school_classes;
+
+drop policy if exists "Authenticated read subjects"
+on public.subjects;
+
+drop policy if exists "Management manages subjects"
+on public.subjects;
+
+drop policy if exists "Teachers manage own subjects"
+on public.subjects;
+
+drop policy if exists "Teachers update own subjects"
+on public.subjects;
+
+-- 10. RLS PROFIL PENGGUNA
+create policy "profiles_select"
+on public.profiles
+for select to authenticated
+using (
+ id = (select auth.uid())
+ or (select public.is_management())
+);
+
+create policy "profiles_management_update"
+on public.profiles
+for update to authenticated
+using ((select public.is_management()))
+with check ((select public.is_management()));
+
+-- Tidak memberikan akses insert atau delete profil
+-- melalui browser. Akun dikelola oleh administrator.
+
+-- 11. RLS KELAS
+create policy "classes_read"
+on public.school_classes
+for select to authenticated
+using (true);
+
+create policy "classes_insert"
+on public.school_classes
+for insert to authenticated
+with check ((select public.is_management()));
+
+create policy "classes_update"
+on public.school_classes
+for update to authenticated
+using ((select public.is_management()))
+with check ((select public.is_management()));
+
+create policy "classes_delete"
+on public.school_classes
+for delete to authenticated
+using ((select public.is_management()));
+
+-- 12. RLS MATA PELAJARAN
+create policy "subjects_read"
+on public.subjects
+for select to authenticated
+using (true);
+
+create policy "subjects_insert"
+on public.subjects
+for insert to authenticated
+with check ((select public.is_management()));
+
+create policy "subjects_update"
+on public.subjects
+for update to authenticated
+using ((select public.is_management()))
+with check ((select public.is_management()));
+
+create policy "subjects_delete"
+on public.subjects
+for delete to authenticated
+using ((select public.is_management()));
+
+-- 13. RLS PENUGASAN GURU
+create policy "assignments_read"
+on public.teaching_assignments
+for select to authenticated
+using (
+ (select public.is_management())
+ or teacher_id = (select auth.uid())
+ or (
+  class_id = (select public.current_class_id())
+  and (select public.current_role()) = 'student'
+ )
+);
+
+create policy "assignments_insert"
+on public.teaching_assignments
+for insert to authenticated
+with check ((select public.is_management()));
+
+create policy "assignments_update"
+on public.teaching_assignments
+for update to authenticated
+using ((select public.is_management()))
+with check ((select public.is_management()));
+
+create policy "assignments_delete"
+on public.teaching_assignments
+for delete to authenticated
+using ((select public.is_management()));
+
+-- ============================================
+-- SELESAI MIGRASI DATABASE AKADEMIK
+-- ============================================
